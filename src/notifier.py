@@ -16,148 +16,24 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-import getpass
 import sys
 import argparse
-import datetime
 import cPickle as pickle
-from time import sleep
+import time
 from lxml import html
 from mechanize import Browser, CookieJar
+import pynotify
+import Pytane
 
 global URL
 URL = 'https://noctane.contegix.com'
+if pynotify.init("Pytane"):
+    global oldnotify
+    global newnotify
+    global errorynotify
+else:
+    sys.exit("Could not initialize notifications")
 
-
-class WrongPageError(Exception):
-    '''
-    Error to raise when an unexpected page loads.
-    Program should recover from this.
-    '''
-    def __init__(self, page):
-        self.page = page
-        
-    def __repr__(self):
-        return self.page
-
-class SessionFailureError(Exception):
-    '''
-    Raised when a session expires unexpectedily.
-    '''
-    def __init__(self, page):
-        self.page = page
-        
-    def __repr__(self):
-        return 'Session failed on %s' % self.page
-
-class ScrapingFailureError(Exception):
-    '''
-    General error that data parsing failed.
-    '''
-    def __init__(self, url, tree=None):
-        self.url = url
-        self.tree = tree
-    def __repr__(self):
-        return self.url
-    
-class TicketSummary:
-    '''
-    Parses a Noctane ticket summary given a lxml.html.HtmlElement object with 
-    class="ticket"
-    '''
-    def __init__(self, ticket_tree, ticket=None):
-        # Get the text fields about a ticket.
-        # There is lots of whitespace and escape characters, so strip them.
-        text = [x.strip() for x in ticket_tree.itertext() if x.strip()]
-    
-        self.ticket_num = text[0]
-        # text[1] is also ticketNum
-        self.description = text[2]
-        self.url = '/noc/tickets/' + self.ticket_num
-        self.customer_company = text[3]
-        self.customer_name = text[4]
-        self.engineer_name = text[5]
-        self.engineer_status = text[6]
-        # text[7] is a CSS comment
-        self.ticket_status = text[8]
-        self.date_opened = text[9]
-        self.date_latest = text[10]
-
-    def __str__(self):
-        return '\n'.join([self.ticket_num, self.description, self.url, 
-                          self.customer_company, self.customer_name, self.engineer_name, 
-                          self.engineer_status, self.date_opened, self.date_latest])
-
-
-class TicketComplete:
-    '''
-    Parses a Noctane ticket given a lxml.html
-    '''
-    def __init__(self, ticket_page):
-        if ticket_page.xpath('//span[@class="response_due_badge"]'):
-            self.response_needed = True
-        else:
-            self.response_needed = False
-
-        origin_ticket = ticket_page.xpath('//div[@class="original_ticket healthy reply"]')[0]
-        raw_origin = [x.strip() for x in origin_ticket.itertext() if x.strip()]
-        customer_name = raw_origin[0].replace('Ticket created by ', '').split(' @ ')[0]
-        self.organization_name = raw_origin[0].split(' @ ')[1].replace(' via', '')
-        date = datetime.datetime.strptime(raw_origin[2], '%B %d, %Y @ %I:%M %p')
-        self.origin_response = Response(customer_name, date, raw_origin[3:], Response.TICKET_OPENED)
-
-        raw_responses = []
-        for i in ticket_page.xpath('//ul[@class="ticket_responses"]')[0].iterchildren():
-            # Insert insead of append, so we get the correct cronological order
-            raw_responses.insert(0, i)
-        self.responses = []
-        for i in raw_responses[:-1]:
-            resp = []
-            for t in i.itertext():
-                if t.strip():
-                    resp.append(t.strip())
-            comment_type = resp[0].replace(' from', '')
-            name = resp[1]
-            date = datetime.datetime.strptime(resp[2], '%B %d, %Y @ %I:%M %p')
-            self.responses.append(Response(name, date, resp[3:], comment_type))
-  
-    def __str__(self):
-        msg = 'Response Needed: %s\n' % self.response_needed
-        msg += str(self.origin_response)
-        msg += '\n======================\n'
-        for i in self.responses:
-            msg += 'From %s on %s\n' % (i.name, i.date.strftime('%H:%M %d/%m'))
-        return msg
-    
-    def mostrecent(self):
-        '''
-        Get the most recent response. Returns a Response object.
-        '''
-        if self.responses:
-            return self.responses[-1]
-        else:
-            return self.origin_response
-        
-
-class Response:
-    '''
-    Data about a Noctane response.
-    '''
-    def __init__(self, name, date, text, response_type):
-        '''
-        Create a response. date is a datetime object. The type of response can be INTERNAL_COMMENT, INTERNAL_REPLY,
-        or EXTERNAL_REPLY.
-        '''
-        self.name = name
-        self.date = date
-        self.text = text
-        self.response_type = response_type 
-    
-    def __str__(self):
-        return '\n'.join((self.response_type, self.name, self.date.strftime('%H:%M %d/%m/%Y'), '\n'.join(self.text)))
-
-
-# End Class definitions
 
 def parser():
     '''
@@ -167,6 +43,8 @@ def parser():
     parser_.add_argument('-u', '--user', nargs=1, help='Noctane user name')
     parser_.add_argument('-e', '--expire-time', type=int, dest='expire', default=10, metavar='N', help='Notifications expire after N seconds.')
     parser_.add_argument('-i', '--check-interval', type=int, dest='interval', default=60, metavar='N', help='Check for tickets every N seconds.')
+    parser_.add_argument('-n', '--new-notify', type=int, dest='nnotify', default=60, metavar='N', help='Send notifications every N seconds for new tickets.')
+    parser_.add_argument('-o', '--old-notify', type=int, dest='onotify', default=600, metavar='N', help='Send notifications every N seconds for old tickets.')
     parser_.add_argument('-d', '--detail', action='append_const', const=True, default=[], help='Increase notification detail. Add additional arguments to get more detail.')
     parser_.add_argument('-v', '--verbose', action='append_const', dest='verbosity', default=[], const=True, help='Verbose output to the terminal (does not affect notification verbosity). Add additional arguments to further increase.')
     group = parser_.add_mutually_exclusive_group()
@@ -184,135 +62,70 @@ def parser():
         args.detail = len(args.detail)
         return args
 
-def browserInit():
-    '''
-    Set standard, initial browser configuration.
-    '''
-    browser = Browser()
-    browser.set_handle_equiv(True)
-    browser.set_handle_redirect(True)
-    browser.set_handle_referer(True)
-    browser.set_handle_robots(False)
-    browser.addheaders = [('user-agent', '   Mozilla/5.0 (X11; U; Linux x86_64; en-US) Mechanize/0.2.4 Fedora/16 (Verne) Pytane/0.2'),
-('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')]
-    return browser
-
-def login(browser, user, tries=3):
-    '''
-    Login to website.
-    '''
-    for i in xrange(1, 4):
-        if i > 1:
-            print('Invalid credentials. Attempt %i/3' % i)
-        if not user or i > 1:
-            username = raw_input('Noctane user name: ')
-        password = getpass.getpass('Noctane password: ')
-        browser.open(URL + '/sign_in')
-        try:
-            if browser.title() != 'Noctane Login':
-                raise WrongPageError(browser.title())
-        except Browser.BrowserStateError:
-            raise WrongPageError(None)
-        browser.select_form(nr=0)
-        browser.form['session[email]'] = username
-        browser.form['session[password]'] = password
-        browser.submit()
-        if browser.geturl() not in (URL + '/dashboard', URL + '/noc/tickets/mine'):
-            print(URL + '/noc/tickets/mine')
-            print(browser.title())
-            print(browser.geturl())
-            browser.back()
-        else:
-            return
-
-    raise SessionFailureError(browser.title())
-
-def loadTickets(browser):
-    '''
-    Load webpage that lists tickets. Nothing further.
-    '''
-
-    browser.open(URL + '/noc/tickets/mine')
-    if browser.title() != 'Tickets Assigned to Me \xe2\x80\x93 Noctane':
-        raise WrongPageError(browser.geturl())
-    return
-
-def scrapTickets(browser, scrap_level=1):
-    '''
-    Parse ticket page and return a list of ticket data.
-    Scrap_level determines how much ticket data is collected:
-    0 = do not fetch full data about any tickets
-    1 = fetch full data for new tickets only
-    2 = fetch full data for all tickets
-    Summary data will be fetched for all tickets.
-    '''
-    data = browser.response().read()
-    parseTree = html.document_fromstring(data)
-    existingtickets_tree = parseTree.xpath('//tr[@class="ticket"]')
-    newtickets_tree = parseTree.xpath('//tr[@class="ticket due"]')
-    tickets = []
-    newtickets = []
-    for i in existingtickets_tree:
-        if scrap_level > 1:
-            url = URL + TicketSummary(i).url
-            browser.open(url)
-            data = browser.response().read()
-            tickets.append(TicketComplete(html.document_fromstring(data)))
-        else:
-            tickets.append(TicketSummary(i))
-    for i in newtickets_tree:
-        if scrap_level > 0:
-            url = URL + TicketSummary(i).url
-            browser.open(url)
-            data = browser.response().read()
-            newtickets.append(TicketComplete(html.document_fromstring(data)))
-        else:
-            newtickets.append(TicketSummary(i))
-    return tickets, newtickets
     
-def notify(oldtickets, newtickets):
+def notify(title, msg, urgency=pynotify.URGENCY_CRITICAL):
     '''
     Trigger notification system. Currently it just prints to 
     the terminal.
     '''
-    if newtickets:
-        print('New Tickets')
-    for i in newtickets:
-        print(i)
-        print('==========')
-    if oldtickets:
-        print('Old Tickets')
-    for i in oldtickets:
-        print(i)
-        print('==========')
+    newnotify = pynotify.Notification(title, msg)
+    newnotify.set_urgency(urgency)
+    newnotify.show()
     return
 
-def notifyLogin():
-    '''
-    Send a notification that communication was lost with Noctane and pytane quit.
-    '''
-    pass
 
-def eventLoop(browser, interval, detail):
+def eventLoop(browser, interval, detail, nnotify, onotify):
     '''
     Check for tickets periodically.
     '''
+    last = 0
+    nlast = 0
+    olast = 0
     while True:
         try:
-            loadTickets(browser)
-        except WrongPageError as e:
+            print('loop')
+            current = int(time.time())
+            print('%i > %i + %i (%i)' % (current, last, interval, last + interval))
+            if current > last + interval:
+                print('load tickets')
+                Pytane.loadTickets(browser)
+                last = current
+            else:
+                print('Sleeping for %i' % (last + interval - current))
+                if last + interval - current < 2:
+                    time.sleep(2)
+                else:
+                    time.sleep(last + interval - current)
+                continue
+        except Pytane.WrongPageError as e:
             if e.page == URL + '/sign_in':
-                notifyLogin()
-                sys.exit('Noctane session failed/expired. Rerun pytane to login again.')
+                notify("Fatal Error", 'Noctane session failed/expired. Rerun pytane to login again.')
+                sys.exit(1)
         else:
-            oldtickets, newtickets = scrapTickets(browser, detail) 
-            notify(oldtickets, newtickets)
-            sleep(interval)
+            oldtickets, newtickets = Pytane.scrapTickets(browser, detail) 
+            print(oldtickets)
+            print(newtickets)
+            if newtickets and current > nlast + nnotify:
+                msg = []
+                for i in newtickets:
+                    msg.append('%s: %s\t\t%s' % (i.date_latest, i.description[:30], i.customer_name[:15]))
+                notify("New Tickets", '\n=========\n'.join(msg))
+                nlast = current
+                time.sleep(10)
+            print('Old: %i > %i + %i (%i)' % (current, last, onotify, last + onotify))
+            if oldtickets and current > olast + onotify:
+                msg = []
+                for i in oldtickets:
+                    msg.append('%s: %s\t\t%s' % (i.date_latest, i.description[:30], i.customer_name[:15]))
+                notify("Old Tickets", '\n=========\n'.join(msg), pynotify.URGENCY_LOW)
+                olast = current
+
+    return
     
 if __name__ == '__main__':
     try:
         args = parser()
-        browser = browserInit()
+        browser = Pytane.browserInit()
         
         cookie = None
         good_cookie = True
@@ -337,24 +150,24 @@ if __name__ == '__main__':
                 browser.__dict__['_ua_handlers']['_cookies'].cookiejar = cookie
 
         try:
-            loadTickets(browser)
-        except WrongPageError as e:
+            Pytane.loadTickets(browser)
+        except Pytane.WrongPageError as e:
             if e.page == URL + '/sign_in':
                 if args.cookie:
                     good_cookie = False
                     print('Your cookie was invalid or new. Opening a new session.')
                     # Creating a new browser object in case invalid cookies aren't overwritten
                     # once we use password login page.
-                    browser = browserInit()
+                    browser = Pytane.browserInit()
                 try:
-                    login(browser, args.user)
-                except SessionFailureError:
+                    Pytane.login(browser, args.user)
+                except Pytane.SessionFailureError:
                     sys.exit('Could not login to Noctane.')
     except (KeyboardInterrupt, SystemExit, EOFError):
         sys.exit('\n\nExiting on user command\n')
 
     try:
-        eventLoop(browser, args.interval, args.detail)
+        eventLoop(browser, args.interval, args.detail, args.nnotify, args.onotify)
     except (KeyboardInterrupt, SystemExit, EOFError):
         print('\n\nExiting on user command\n')
     finally:
