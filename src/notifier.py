@@ -27,12 +27,7 @@ import Pytane
 
 global URL
 URL = 'https://noctane.contegix.com'
-if pynotify.init("Pytane"):
-    global oldnotify
-    global newnotify
-    global errorynotify
-else:
-    sys.exit("Could not initialize notifications")
+
 
 
 def parser():
@@ -63,13 +58,13 @@ def parser():
         return args
 
     
-def notify(title, msg, urgency=pynotify.URGENCY_CRITICAL):
+def notify(title, msg):
     '''
     Trigger notification system. Currently it just prints to 
     the terminal.
     '''
     newnotify = pynotify.Notification(title, msg)
-    newnotify.set_urgency(urgency)
+    newnotify.set_urgency(pynotify.URGENCY_NORMAL)
     newnotify.show()
     return
 
@@ -77,6 +72,10 @@ def notify(title, msg, urgency=pynotify.URGENCY_CRITICAL):
 def eventLoop(browser, interval, detail, nnotify, onotify):
     '''
     Check for tickets periodically.
+    Support for three intervals complicates this function.
+    interval: seconds between checks to Noctane.
+    nnotify: seconds between sending notifications about new tickets.
+    onotify: seconds between sending notifications about old tickets.
     '''
     last = 0
     nlast = 0
@@ -93,6 +92,7 @@ def eventLoop(browser, interval, detail, nnotify, onotify):
             else:
                 print('Sleeping for %i' % (last + interval - current))
                 if last + interval - current < 2:
+                    # Corrects for rounding errors. Could avoid infinite, short sleeps.
                     time.sleep(2)
                 else:
                     time.sleep(last + interval - current)
@@ -103,27 +103,31 @@ def eventLoop(browser, interval, detail, nnotify, onotify):
                 sys.exit(1)
         else:
             oldtickets, newtickets = Pytane.scrapTickets(browser, detail) 
-            print(oldtickets)
-            print(newtickets)
+            newtickets_shown = False
             if newtickets and current > nlast + nnotify:
                 msg = []
                 for i in newtickets:
                     msg.append('%s: %s\t\t%s' % (i.date_latest, i.description[:30], i.customer_name[:15]))
                 notify("New Tickets", '\n=========\n'.join(msg))
                 nlast = current
-                time.sleep(10)
+                newtickets_shown = True
             print('Old: %i > %i + %i (%i)' % (current, last, onotify, last + onotify))
             if oldtickets and current > olast + onotify:
+                if newtickets_shown:
+                    # Give new tickets notification a chance to clear.
+                    time.sleep(10)
                 msg = []
                 for i in oldtickets:
                     msg.append('%s: %s\t\t%s' % (i.date_latest, i.description[:30], i.customer_name[:15]))
-                notify("Old Tickets", '\n=========\n'.join(msg), pynotify.URGENCY_LOW)
+                notify("Old Tickets", '\n=========\n'.join(msg))
                 olast = current
 
     return
     
 if __name__ == '__main__':
     try:
+        if not pynotify.init("Pytane"):
+            sys.exit("Could not initialize notifications")
         args = parser()
         browser = Pytane.browserInit()
         
@@ -163,6 +167,7 @@ if __name__ == '__main__':
                     Pytane.login(browser, args.user)
                 except Pytane.SessionFailureError:
                     sys.exit('Could not login to Noctane.')
+
     except (KeyboardInterrupt, SystemExit, EOFError):
         sys.exit('\n\nExiting on user command\n')
 
